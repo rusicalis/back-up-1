@@ -1,0 +1,1237 @@
+import 'dart:math' as math;
+import 'dart:ui' as ui;
+import 'package:flutter/material.dart';
+import '../models/plating_models.dart';
+import '../providers/plating_provider.dart';
+import '../services/simulation_service.dart';
+// ============================================================
+// 3D 투영 시스템 (X=폭, Y=높이, Z=길이)
+// ============================================================
+class Proj3D {
+  final double rotX, rotY;
+  final double zoom;
+  final Offset center;
+  final double scale;
+
+  const Proj3D({
+    required this.rotX, required this.rotY,
+    required this.zoom, required this.center, required this.scale,
+  });
+
+  Offset project(Vec3 v) {
+    final rx = rotX * math.pi / 180.0;
+    final ry = rotY * math.pi / 180.0;
+
+    double x1 = v.x * math.cos(ry) - v.z * math.sin(ry);
+    double y1 = v.y;
+    double z1 = v.x * math.sin(ry) + v.z * math.cos(ry);
+
+    double x2 = x1;
+    double y2 = y1 * math.cos(rx) - z1 * math.sin(rx);
+    double z2 = y1 * math.sin(rx) + z1 * math.cos(rx);
+
+    const double fov = 800.0;
+    final persp = fov / (fov + z2 + 300.0);
+    return Offset(
+      center.dx + x2 * scale * zoom * persp,
+      center.dy - y2 * scale * zoom * persp,
+    );
+  }
+
+  double projectDepth(Vec3 v) {
+    final rx = rotX * math.pi / 180.0;
+    final ry = rotY * math.pi / 180.0;
+    final y1 = v.y;
+    final z1 = v.x * math.sin(ry) + v.z * math.cos(ry);
+    return y1 * math.sin(rx) + z1 * math.cos(rx);
+  }
+
+  bool isFrontFace(Offset p0, Offset p1, Offset p2) {
+    final cross = (p1.dx - p0.dx) * (p2.dy - p0.dy) -
+                  (p1.dy - p0.dy) * (p2.dx - p0.dx);
+    return cross <= 0;
+  }
+}
+
+// ============================================================
+// 히트맵 색상 (파란→청록→초록→노랑→빨강) — 완전 불투명
+// ============================================================
+Color heatColor(double t) {
+  t = t.clamp(0.0, 1.0);
+  if (t < 0.25) {
+    return Color.fromARGB(255, 0, (t/0.25*255).round(), 255);
+  } else if (t < 0.5) {
+    return Color.fromARGB(255, 0, 255, ((1-(t-0.25)/0.25)*255).round());
+  } else if (t < 0.75) {
+    return Color.fromARGB(255, ((t-0.5)/0.25*255).round(), 255, 0);
+  } else {
+    return Color.fromARGB(255, 255, ((1-(t-0.75)/0.25)*255).round(), 0);
+  }
+}
+
+// 전기장 분포 컬러맵 (파란→보라→핑크→흰색) — 완전 불투명
+Color fieldStrengthColor(double t) {
+  t = t.clamp(0.0, 1.0);
+  if (t < 0.33) {
+    final u = t / 0.33;
+    return Color.fromARGB(255, (u * 100).round(), (u * 20).round(), 200);
+  } else if (t < 0.66) {
+    final u = (t - 0.33) / 0.33;
+    return Color.fromARGB(255, (100 + u * 155).round(), (20 + u * 10).round(), (200 + u * 55).round());
+  } else {
+    final u = (t - 0.66) / 0.34;
+    return Color.fromARGB(255, 255, (30 + u * 225).round(), (255 * u).round());
+  }
+}
+
+// ============================================================
+// 렌더링 요소 (깊이 정렬용)
+// ============================================================
+class _RenderItem {
+  final List<Vec3> verts;
+  final Color fillColor;
+  final Color? edgeColor;
+  final double depth;
+  final bool isEdgeOnly;
+  // isOpaquePatch=true 이면 back-face culling 없이 항상 렌더링
+  final bool isOpaquePatch;
+
+  const _RenderItem({
+    required this.verts,
+    required this.fillColor,
+    this.edgeColor,
+    required this.depth,
+    this.isEdgeOnly = false,
+    this.isOpaquePatch = false,
+  });
+}
+
+// 불투명 패치 전용 서브클래스 (back-face culling 우회)
+class _RenderItemOpaque extends _RenderItem {
+  const _RenderItemOpaque({
+    required super.verts,
+    required super.fillColor,
+    required super.depth,
+  }) : super(isOpaquePatch: true);
+}
+
+// ============================================================
+// 메인 3D 씬 페인터
+// ============================================================
+class PlatingScene3DPainter extends CustomPainter {
+  final PlatingProvider p;
+
+  PlatingScene3DPainter({required this.p});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final tank = p.tank;
+    final anode = p.anode;
+    final products = p.products;
+
+    // 스케일 계산
+    final maxDim = [tank.width, tank.depth, tank.length].reduce(math.max);
+    final baseScale = (size.shortestSide * 0.32) / maxDim.clamp(1.0, 10000.0);
+
+    final proj = Proj3D(
+      rotX: p.rotX, rotY: p.rotY,
+      zoom: p.zoom,
+      center: Offset(size.width / 2 + p.panX, size.height / 2 + p.panY),
+      scale: baseScale,
+    );
+
+    final hw = tank.width / 2;
+    final hd = tank.depth;
+    final hl = tank.length / 2;
+    final sl = tank.solutionLevel;
+
+    final renderItems = <_RenderItem>[];
+
+    // ① 탱크
+    if (p.showTank) {
+      _collectTankItems(renderItems, proj, hw, hd, hl, sl);
+    }
+
+    // ② 양극 (다수 제품 기반) — showAnodes 플래그 적용
+    final anodePositions = PlatingSimulationService.getAnodePositionsMulti(
+      tank: tank, anode: anode, products: products,
+    );
+    if (p.showAnodes) {
+      _collectAnodeItems(renderItems, proj, anode, anodePositions, sl);
+    }
+
+    // ③ 두께 포인트 / 전기장 포인트 별로 제품 ID 분류
+    final Map<String, List<ThicknessPoint>> thickByProduct = {};
+    for (final tp in p.thicknessPoints) {
+      thickByProduct.putIfAbsent(tp.productId, () => []).add(tp);
+    }
+    final Map<String, List<FieldStrengthPoint>> fieldByProduct = {};
+    for (final fp in p.fieldStrengthPoints) {
+      fieldByProduct.putIfAbsent(fp.productId, () => []).add(fp);
+    }
+
+    // ④ 제품들 렌더링
+    for (int i = 0; i < products.length; i++) {
+      final product = products[i];
+      final productThick = thickByProduct[product.id] ?? [];
+      final productField = fieldByProduct[product.id] ?? [];
+      final isSelected = i == p.selectedProductIndex;
+      _collectProductItems(
+        renderItems, proj, product, productThick, productField,
+        p.showHeatmap, p.heatmapMode, sl, isSelected, i,
+      );
+    }
+
+    // ⑤ 마스킹 영역 (선택된 제품 기준)
+    if (p.maskingZones.isNotEmpty && products.isNotEmpty) {
+      _collectMaskingItems(renderItems, proj, p.product, p.maskingZones);
+    }
+
+    // 깊이 정렬
+    renderItems.sort((a, b) => a.depth.compareTo(b.depth));
+
+    // 렌더링
+    for (final item in renderItems) {
+      if (item.verts.length < 2) continue;
+      final pts = item.verts.map((v) => proj.project(v)).toList();
+
+      if (item.isEdgeOnly) {
+        final path = Path()..moveTo(pts.first.dx, pts.first.dy);
+        for (int i = 1; i < pts.length; i++) { path.lineTo(pts[i].dx, pts[i].dy); }
+        if (item.verts.length > 2) path.close();
+        canvas.drawPath(path, Paint()
+          ..color = item.fillColor
+          ..strokeWidth = 1.5
+          ..style = PaintingStyle.stroke);
+        continue;
+      }
+
+      // 불투명 패치: back-face culling 없이 항상 렌더링
+      if (!item.isOpaquePatch) {
+        if (pts.length >= 3 && !proj.isFrontFace(pts[0], pts[1], pts[2])) continue;
+      }
+
+      final path = Path()..moveTo(pts[0].dx, pts[0].dy);
+      for (int i = 1; i < pts.length; i++) { path.lineTo(pts[i].dx, pts[i].dy); }
+      path.close();
+
+      canvas.drawPath(path, Paint()..color = item.fillColor);
+      if (item.edgeColor != null) {
+        canvas.drawPath(path, Paint()
+          ..color = item.edgeColor!
+          ..strokeWidth = 0.5
+          ..style = PaintingStyle.stroke);
+      }
+    }
+
+    // ⑥ 전기력선 (3D 모드일 때만)
+    if (p.showFieldLines && p.fieldLines.isNotEmpty && p.fieldLine2DMode == FieldLine2DMode.none) {
+      _drawFieldLines(canvas, proj, p.fieldLines, sl);
+    }
+
+    // ⑦ 라벨 & 치수선
+    _drawLabels(canvas, proj, tank, anode, products, anodePositions, sl);
+
+    // ⑧ 좌표축
+    _drawAxes(canvas, proj, maxDim * 0.25);
+
+    // ⑨ 범례
+    if (p.showHeatmap) {
+      if (p.heatmapMode == HeatmapMode.thickness && p.thicknessPoints.isNotEmpty) {
+        _drawThicknessLegend(canvas, size, p.thicknessPoints);
+      } else if (p.heatmapMode == HeatmapMode.fieldStrength && p.fieldStrengthPoints.isNotEmpty) {
+        _drawFieldStrengthLegend(canvas, size, p.fieldStrengthPoints);
+      }
+    }
+
+    // ⑩ 줌 레벨 + 제품 정보
+    _drawOverlayInfo(canvas, size, p);
+  }
+
+  // ----------------------------------------------------------
+  // 탱크 렌더
+  // ----------------------------------------------------------
+  void _collectTankItems(List<_RenderItem> items, Proj3D proj,
+      double hw, double hd, double hl, double sl) {
+    final v = [
+      Vec3(-hw, 0,  -hl), Vec3(hw, 0,  -hl),
+      Vec3(hw,  0,  hl),  Vec3(-hw, 0, hl),
+      Vec3(-hw, hd, -hl), Vec3(hw,  hd, -hl),
+      Vec3(hw,  hd, hl),  Vec3(-hw, hd, hl),
+    ];
+
+    final faces = [
+      ([v[0],v[1],v[5],v[4]], const Color(0x15607D8B)),
+      ([v[3],v[2],v[6],v[7]], const Color(0x12607D8B)),
+      ([v[0],v[3],v[7],v[4]], const Color(0x12607D8B)),
+      ([v[1],v[2],v[6],v[5]], const Color(0x12607D8B)),
+      ([v[0],v[1],v[2],v[3]], const Color(0x18607D8B)),
+    ];
+
+    for (final (faceVerts, color) in faces) {
+      final centerV = faceVerts.fold<Vec3>(Vec3.zero, (acc, v2) => acc + v2) / faceVerts.length.toDouble();
+      items.add(_RenderItem(
+        verts: faceVerts,
+        fillColor: color,
+        edgeColor: Colors.blueGrey.shade400.withValues(alpha: 0.5),
+        depth: proj.projectDepth(centerV),
+      ));
+    }
+
+    // 용액면
+    if (sl > 0 && sl <= hd) {
+      final solFace = [
+        Vec3(-hw, sl, -hl), Vec3(hw, sl, -hl),
+        Vec3(hw, sl, hl),  Vec3(-hw, sl, hl),
+      ];
+      items.add(_RenderItem(
+        verts: solFace,
+        fillColor: const Color(0x3000B4D8),
+        edgeColor: const Color(0x8800B4D8),
+        depth: proj.projectDepth(Vec3(0, sl, 0)) - 0.1,
+      ));
+    }
+  }
+
+  // ----------------------------------------------------------
+  // 양극 렌더
+  // ----------------------------------------------------------
+  void _collectAnodeItems(List<_RenderItem> items, Proj3D proj,
+      AnodeSettings anode, List<(Vec3, Vec3)> positions, double sl) {
+    for (int ai = 0; ai < positions.length; ai++) {
+      final (center, _) = positions[ai];
+      final hw = anode.width / 2;
+      final hd = anode.depth / 2;
+      final hl = anode.length / 2;
+
+      final yBot = center.y - hd;
+      final yTop = math.min(center.y + hd, sl);
+
+      if (yBot >= sl) continue;
+
+      final isLeft = ai % 2 == 0;
+
+      final verts = [
+        Vec3(center.x-hw, yBot, center.z-hl),
+        Vec3(center.x+hw, yBot, center.z-hl),
+        Vec3(center.x+hw, yTop, center.z-hl),
+        Vec3(center.x-hw, yTop, center.z-hl),
+        Vec3(center.x-hw, yBot, center.z+hl),
+        Vec3(center.x+hw, yBot, center.z+hl),
+        Vec3(center.x+hw, yTop, center.z+hl),
+        Vec3(center.x-hw, yTop, center.z+hl),
+      ];
+
+      final fillColor = isLeft
+          ? const Color(0xBBFF8C00)
+          : const Color(0xBBFF6030);
+
+      _addBoxItems(items, proj, verts, fill: fillColor, edge: const Color(0xFFFF6500));
+
+      final yTopFull = center.y + hd;
+      if (yTopFull > sl) {
+        final vertsAbove = [
+          Vec3(center.x-hw, sl, center.z-hl), Vec3(center.x+hw, sl, center.z-hl),
+          Vec3(center.x+hw, yTopFull, center.z-hl), Vec3(center.x-hw, yTopFull, center.z-hl),
+          Vec3(center.x-hw, sl, center.z+hl), Vec3(center.x+hw, sl, center.z+hl),
+          Vec3(center.x+hw, yTopFull, center.z+hl), Vec3(center.x-hw, yTopFull, center.z+hl),
+        ];
+        _addBoxItems(items, proj, vertsAbove,
+            fill: const Color(0x44888888), edge: const Color(0x66888888));
+      }
+    }
+  }
+
+  // ----------------------------------------------------------
+  // 제품 + 히트맵 렌더
+  // 모드: thickness (도금두께) / fieldStrength (전기장강도)
+  // ----------------------------------------------------------
+  void _collectProductItems(
+      List<_RenderItem> items, Proj3D proj,
+      ProductSettings product,
+      List<ThicknessPoint> thicknessPoints,
+      List<FieldStrengthPoint> fieldPoints,
+      bool showHeatmap, HeatmapMode heatmapMode,
+      double sl, bool isSelected, int productIdx) {
+
+    if (product.useLegoMode && product.legoPieces.isNotEmpty) {
+      _collectLegoItems(items, proj, product, thicknessPoints, fieldPoints,
+          showHeatmap, heatmapMode, sl, isSelected);
+      return;
+    }
+
+    final cx = product.posX;
+    final cy = product.posY + product.depth / 2;
+    final cz = product.posZ;
+    final hw = product.width / 2;
+    final hd = product.depth / 2;
+    final hl = product.length / 2;
+
+    // 히트맵 표시
+    if (showHeatmap) {
+      if (heatmapMode == HeatmapMode.thickness && thicknessPoints.isNotEmpty) {
+        _renderThicknessPatches(items, proj, thicknessPoints, product);
+      } else if (heatmapMode == HeatmapMode.fieldStrength && fieldPoints.isNotEmpty) {
+        _renderFieldStrengthPatches(items, proj, fieldPoints, product);
+      }
+    }
+
+    // 제품 와이어프레임
+    final boxVerts = [
+      Vec3(cx-hw, cy-hd, cz-hl), Vec3(cx+hw, cy-hd, cz-hl),
+      Vec3(cx+hw, cy+hd, cz-hl), Vec3(cx-hw, cy+hd, cz-hl),
+      Vec3(cx-hw, cy-hd, cz+hl), Vec3(cx+hw, cy-hd, cz+hl),
+      Vec3(cx+hw, cy+hd, cz+hl), Vec3(cx-hw, cy+hd, cz+hl),
+    ];
+
+    final hasHeatData = (heatmapMode == HeatmapMode.thickness && thicknessPoints.isNotEmpty) ||
+        (heatmapMode == HeatmapMode.fieldStrength && fieldPoints.isNotEmpty);
+
+    if (!showHeatmap || !hasHeatData) {
+      final alphaVal = (0x66 + productIdx * 10).clamp(0, 255);
+      final blueVal = (0x40 + productIdx * 5).clamp(0, 255);
+      final prodColor = isSelected
+          ? const Color(0xAA40C0F0)
+          : Color.fromARGB(alphaVal, blueVal, 0xA0, 0xD0);
+      final edgeColor = isSelected
+          ? Colors.lightBlueAccent
+          : Colors.lightBlue.withValues(alpha: 0.7);
+      _addBoxItems(items, proj, boxVerts, fill: prodColor, edge: edgeColor);
+    } else {
+      final wireColor = isSelected
+          ? Colors.lightBlueAccent
+          : Colors.lightBlue.withValues(alpha: 0.4);
+      _addBoxEdgeLines(items, proj, boxVerts, color: wireColor);
+    }
+
+    if (isSelected) {
+      _addBoxEdgeLines(items, proj, boxVerts,
+          color: Colors.cyanAccent.withValues(alpha: 0.5));
+    }
+  }
+
+  // 도금 두께 패치 렌더링
+  // gridResolution=25 → 각 면: 25개 격자, 격자 간격 = dim/25
+  // patchSize = 격자 간격 × 1.05 (미세 오버랩으로 틈새 완전 제거)
+  void _renderThicknessPatches(List<_RenderItem> items, Proj3D proj,
+      List<ThicknessPoint> thicknessPoints, ProductSettings product) {
+    double minT = double.infinity, maxT = double.negativeInfinity;
+    for (final tp in thicknessPoints) {
+      if (tp.inSolution && !tp.isMasked && tp.thickness > 0) {
+        if (tp.thickness < minT) minT = tp.thickness;
+        if (tp.thickness > maxT) maxT = tp.thickness;
+      }
+    }
+    if (minT == double.infinity) { minT = 0; maxT = 1; }
+    final rangeT = (maxT - minT).clamp(0.001, 10000.0);
+
+    // patchSize = 각 면의 실제 격자 간격 기반 계산 (제품 크기 무관, gridRes=25 기준)
+    // X면: Y/Z 방향 격자 간격, Y면: X/Z 방향, Z면: X/Y 방향
+    // 가장 작은 격자 간격을 사용해서 항상 틈새가 없도록 보장
+    const gridRes = 25;
+    final xStep = (product.depth  * 2) / gridRes;  // X면의 Y방향 간격
+    final yStep = (product.width  * 2) / gridRes;  // Y면의 X방향 간격  
+    final zStep = (product.width  * 2) / gridRes;  // Z면의 X방향 간격
+    final baseStep = math.min(xStep, math.min(yStep, zStep)).clamp(0.05, double.infinity);
+    final patchSize = baseStep * 1.08; // 8% 오버랩으로 완전 빈틈 제거
+
+    for (final tp in thicknessPoints) {
+      Color col;
+      if (!tp.inSolution) {
+        // 용액 밖 → 완전 스킵 (렌더링 안 함)
+        continue;
+      } else if (tp.isMasked) {
+        col = const Color(0xFF1A1A44);  // 불투명 마스킹 색
+      } else {
+        final t = (tp.thickness - minT) / rangeT;
+        col = heatColor(t);
+      }
+
+      _addSurfacePatchOpaque(items, proj, tp.position, tp.normal, patchSize, col);
+    }
+  }
+
+  // 전기장 분포 패치 렌더링
+  void _renderFieldStrengthPatches(List<_RenderItem> items, Proj3D proj,
+      List<FieldStrengthPoint> fieldPoints, ProductSettings product) {
+    double minS = double.infinity, maxS = double.negativeInfinity;
+    for (final fp in fieldPoints) {
+      if (fp.inSolution && fp.strength > 0) {
+        if (fp.strength < minS) minS = fp.strength;
+        if (fp.strength > maxS) maxS = fp.strength;
+      }
+    }
+    if (minS == double.infinity) { minS = 0; maxS = 1; }
+    final rangeS = (maxS - minS).clamp(1e-10, double.infinity);
+
+    const gridRes = 25;
+    final xStep = (product.depth  * 2) / gridRes;
+    final yStep = (product.width  * 2) / gridRes;
+    final zStep = (product.width  * 2) / gridRes;
+    final baseStep = math.min(xStep, math.min(yStep, zStep)).clamp(0.05, double.infinity);
+    final patchSize = baseStep * 1.08;
+
+    for (final fp in fieldPoints) {
+      if (!fp.inSolution) continue;  // 용액 밖 스킵
+      final t = (fp.strength - minS) / rangeS;
+      final col = fieldStrengthColor(t);
+      _addSurfacePatchOpaque(items, proj, fp.position, fp.normal, patchSize, col);
+    }
+  }
+
+  // 불투명 표면 패치 추가 헬퍼
+  // 수정: 카메라 방향(view vector)과 법선의 dot product로 보임 여부 판단
+  //  - dot > 0  → 카메라를 향하는 면 → 표시
+  //  - dot <= 0 → 카메라 반대 면 → 스킵 (올바른 컬링)
+  void _addSurfacePatchOpaque(List<_RenderItem> items, Proj3D proj,
+      Vec3 pos, Vec3 n3, double gs, Color col) {
+    // 카메라가 바라보는 방향 계산 (회전 역변환)
+    final rx = proj.rotX * math.pi / 180.0;
+    final ry = proj.rotY * math.pi / 180.0;
+
+    // 뷰 공간에서 카메라는 +Z에서 원점을 바라봄
+    // 법선을 뷰 공간으로 변환해서 Z 성분 확인
+    // rotY(ry): nx' = nx*cos(ry)+nz*sin(ry), nz' = -nx*sin(ry)+nz*cos(ry)
+    final nx1 = n3.x * math.cos(ry) - n3.z * math.sin(ry);
+    final ny1 = n3.y;
+    final nz1 = n3.x * math.sin(ry) + n3.z * math.cos(ry);
+    // rotX(rx): ny'' = ny*cos(rx)-nz'*sin(rx), nz'' = ny*sin(rx)+nz'*cos(rx)
+    final nz2 = ny1 * math.sin(rx) + nz1 * math.cos(rx);
+
+    // 뷰공간 Z축(카메라 방향) 과의 내적 — nz2가 양수면 카메라를 향하는 면
+    if (nz2 <= 0.0) return;  // 카메라 반대방향 면 → 렌더 안 함
+
+    final List<Vec3> patch;
+    if (n3.x.abs() > 0.5) {
+      patch = [
+        Vec3(pos.x, pos.y-gs/2, pos.z-gs/2),
+        Vec3(pos.x, pos.y-gs/2, pos.z+gs/2),
+        Vec3(pos.x, pos.y+gs/2, pos.z+gs/2),
+        Vec3(pos.x, pos.y+gs/2, pos.z-gs/2),
+      ];
+    } else if (n3.y.abs() > 0.5) {
+      patch = [
+        Vec3(pos.x-gs/2, pos.y, pos.z-gs/2),
+        Vec3(pos.x+gs/2, pos.y, pos.z-gs/2),
+        Vec3(pos.x+gs/2, pos.y, pos.z+gs/2),
+        Vec3(pos.x-gs/2, pos.y, pos.z+gs/2),
+      ];
+    } else {
+      patch = [
+        Vec3(pos.x-gs/2, pos.y-gs/2, pos.z),
+        Vec3(pos.x+gs/2, pos.y-gs/2, pos.z),
+        Vec3(pos.x+gs/2, pos.y+gs/2, pos.z),
+        Vec3(pos.x-gs/2, pos.y+gs/2, pos.z),
+      ];
+    }
+
+    final centerV = patch.fold<Vec3>(Vec3.zero, (acc, v) => acc + v) / 4.0;
+    final depth = proj.projectDepth(centerV);
+
+    // 일반 _RenderItem (isOpaquePatch=false) — 이미 뷰-노멀 기반으로 컬링했으므로
+    // back-face culling 없이 그냥 그리면 됨
+    items.add(_RenderItem(
+      verts: patch,
+      fillColor: col,
+      depth: depth,
+      isOpaquePatch: true,  // culling 우회 (이미 위에서 처리)
+    ));
+  }
+
+  // 레고 피스 렌더링
+  void _collectLegoItems(List<_RenderItem> items, Proj3D proj,
+      ProductSettings product,
+      List<ThicknessPoint> thicknessPoints,
+      List<FieldStrengthPoint> fieldPoints,
+      bool showHeatmap, HeatmapMode heatmapMode,
+      double sl, bool isSelected) {
+
+    final baseCX = product.posX;
+    final baseCY = product.posY + product.depth / 2;
+    final baseCZ = product.posZ;
+
+    if (showHeatmap) {
+      if (heatmapMode == HeatmapMode.thickness && thicknessPoints.isNotEmpty) {
+        _renderThicknessPatches(items, proj, thicknessPoints, product);
+      } else if (heatmapMode == HeatmapMode.fieldStrength && fieldPoints.isNotEmpty) {
+        _renderFieldStrengthPatches(items, proj, fieldPoints, product);
+      }
+    }
+
+    // 각 레고 피스 와이어프레임
+    final hasHeatData = (heatmapMode == HeatmapMode.thickness && thicknessPoints.isNotEmpty) ||
+        (heatmapMode == HeatmapMode.fieldStrength && fieldPoints.isNotEmpty);
+
+    for (int pi = 0; pi < product.legoPieces.length; pi++) {
+      final piece = product.legoPieces[pi];
+      final cx = baseCX + piece.offsetX;
+      final cy = baseCY + piece.offsetY;
+      final cz = baseCZ + piece.offsetZ;
+      final hw = piece.width / 2;
+      final hh = piece.height / 2;
+      final hl = piece.length / 2;
+
+      final pieceVerts = [
+        Vec3(cx-hw, cy-hh, cz-hl), Vec3(cx+hw, cy-hh, cz-hl),
+        Vec3(cx+hw, cy+hh, cz-hl), Vec3(cx-hw, cy+hh, cz-hl),
+        Vec3(cx-hw, cy-hh, cz+hl), Vec3(cx+hw, cy-hh, cz+hl),
+        Vec3(cx+hw, cy+hh, cz+hl), Vec3(cx-hw, cy+hh, cz+hl),
+      ];
+
+      if (!showHeatmap || !hasHeatData) {
+        _addBoxItems(items, proj, pieceVerts,
+          fill: piece.color.withValues(alpha: 0.35),
+          edge: piece.color.withValues(alpha: 0.8));
+      } else {
+        _addBoxEdgeLines(items, proj, pieceVerts,
+          color: piece.color.withValues(alpha: isSelected ? 0.7 : 0.4));
+      }
+    }
+  }
+
+  // ----------------------------------------------------------
+  // 마스킹 영역 시각화
+  // ----------------------------------------------------------
+  void _collectMaskingItems(List<_RenderItem> items, Proj3D proj,
+      ProductSettings product, List<MaskingZone> zones) {
+    for (final zone in zones) {
+      final cx = product.posX - product.width/2 +
+          (zone.xMin + zone.xMax) / 2 * product.width;
+      final cy = product.posY + zone.yMin * product.depth +
+          (zone.yMax - zone.yMin) / 2 * product.depth;
+      final cz = product.posZ - product.length/2 +
+          (zone.zMin + zone.zMax) / 2 * product.length;
+      final hw = (zone.xMax - zone.xMin) / 2 * product.width;
+      final hd = (zone.yMax - zone.yMin) / 2 * product.depth;
+      final hl = (zone.zMax - zone.zMin) / 2 * product.length;
+
+      final verts = [
+        Vec3(cx-hw,cy-hd,cz-hl), Vec3(cx+hw,cy-hd,cz-hl),
+        Vec3(cx+hw,cy+hd,cz-hl), Vec3(cx-hw,cy+hd,cz-hl),
+        Vec3(cx-hw,cy-hd,cz+hl), Vec3(cx+hw,cy-hd,cz+hl),
+        Vec3(cx+hw,cy+hd,cz+hl), Vec3(cx-hw,cy+hd,cz+hl),
+      ];
+      _addBoxEdgeLines(items, proj, verts, color: const Color(0xFFAA00AA));
+    }
+  }
+
+  // ----------------------------------------------------------
+  // 박스 헬퍼
+  // ----------------------------------------------------------
+  void _addBoxItems(List<_RenderItem> items, Proj3D proj, List<Vec3> v,
+      {required Color fill, required Color edge}) {
+    final faces = [
+      [v[0],v[1],v[2],v[3]], // 앞
+      [v[5],v[4],v[7],v[6]], // 뒤
+      [v[4],v[0],v[3],v[7]], // 좌
+      [v[1],v[5],v[6],v[2]], // 우
+      [v[3],v[2],v[6],v[7]], // 상
+      [v[4],v[5],v[1],v[0]], // 하
+    ];
+
+    for (final face in faces) {
+      final centerV = face.fold<Vec3>(Vec3.zero, (a, b) => a + b) / 4.0;
+      items.add(_RenderItem(
+        verts: face, fillColor: fill, edgeColor: edge,
+        depth: proj.projectDepth(centerV),
+      ));
+    }
+  }
+
+  void _addBoxEdgeLines(List<_RenderItem> items, Proj3D proj, List<Vec3> v,
+      {Color color = Colors.white38}) {
+    final edges = [
+      [v[0],v[1]], [v[1],v[2]], [v[2],v[3]], [v[3],v[0]],
+      [v[4],v[5]], [v[5],v[6]], [v[6],v[7]], [v[7],v[4]],
+      [v[0],v[4]], [v[1],v[5]], [v[2],v[6]], [v[3],v[7]],
+    ];
+    for (final e in edges) {
+      final d = proj.projectDepth((e[0] + e[1]) / 2.0);
+      items.add(_RenderItem(
+        verts: [e[0], e[1]],
+        fillColor: color,
+        depth: d + 0.5,
+        isEdgeOnly: true,
+      ));
+    }
+  }
+
+  // ----------------------------------------------------------
+  // 전기력선 렌더링 (강도 기반 색상 + 굵기 + 방향 화살표)
+  // 개선: 다중 화살표, 글로우 효과, 강도별 색상 그라데이션
+  // ----------------------------------------------------------
+  void _drawFieldLines(Canvas canvas, Proj3D proj,
+      List<FieldLine> lines, double sl) {
+    // 강도 기준 정렬 (강한 선 위에 렌더)
+    final sortedLines = List<FieldLine>.from(lines)
+      ..sort((a, b) => a.intensity.compareTo(b.intensity));
+
+    for (final line in sortedLines) {
+      if (line.points.length < 2) continue;
+
+      final validPts = line.points.where((pt) => pt.y <= sl + 0.5).toList();
+      if (validPts.length < 2) continue;
+
+      final intens = line.intensity.clamp(0.0, 1.0);
+
+      // 강도에 따른 색상: 낮은→파랑, 중간→노랑, 높은→빨강/흰색
+      final int r, g, b;
+      if (intens < 0.33) {
+        final u = intens / 0.33;
+        r = (u * 100).round();
+        g = (u * 180).round();
+        b = 255;
+      } else if (intens < 0.66) {
+        final u = (intens - 0.33) / 0.33;
+        r = (100 + u * 155).round();
+        g = (180 + u * 75).round();
+        b = (255 - u * 200).round().clamp(0, 255);
+      } else {
+        final u = (intens - 0.66) / 0.34;
+        r = 255;
+        g = (255 - u * 200).round().clamp(0, 255);
+        b = (55 - u * 55).round().clamp(0, 255);
+      }
+
+      final alpha = (intens * 200 + 55).round().clamp(60, 255);
+      final sw = (intens * 2.0 + 0.6).clamp(0.5, 3.0);
+      final mainColor = Color.fromARGB(alpha, r, g, b);
+      final glowColor = Color.fromARGB((alpha * 0.3).round(), r, g, b);
+
+      // 글로우 효과 (강한 선만)
+      if (intens > 0.5) {
+        final glowPaint = Paint()
+          ..color = glowColor
+          ..strokeWidth = sw * 3.0
+          ..style = PaintingStyle.stroke
+          ..strokeCap = StrokeCap.round
+          ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 3.0);
+        final glowPath = _buildLinePath(proj, validPts);
+        canvas.drawPath(glowPath, glowPaint);
+      }
+
+      // 메인 라인
+      final paint = Paint()
+        ..color = mainColor
+        ..strokeWidth = sw
+        ..style = PaintingStyle.stroke
+        ..strokeCap = StrokeCap.round;
+
+      final path = _buildLinePath(proj, validPts);
+      canvas.drawPath(path, paint);
+
+      // 다중 화살표 (1/3, 2/3 지점 + 끝점)
+      final n = validPts.length;
+      if (n >= 4) {
+        final idx1 = n ~/ 3;
+        final idx2 = (n * 2) ~/ 3;
+        // 1/3 지점 화살표 (작은 것)
+        final pm0 = proj.project(validPts[idx1 - 1]);
+        final pm1 = proj.project(validPts[idx1]);
+        _drawArrow(canvas, pm0, pm1,
+            Color.fromARGB((alpha * 0.5).round(), r, g, b), sw * 0.7, 4.0);
+        // 2/3 지점 화살표 (중간 것)
+        final pm2 = proj.project(validPts[idx2 - 1]);
+        final pm3 = proj.project(validPts[idx2]);
+        _drawArrow(canvas, pm2, pm3,
+            Color.fromARGB((alpha * 0.7).round(), r, g, b), sw * 0.9, 5.5);
+      }
+      // 끝점 화살표 (가장 큰 것)
+      final p0 = proj.project(validPts[n - 2]);
+      final p1 = proj.project(validPts[n - 1]);
+      _drawArrow(canvas, p0, p1, mainColor, sw, 7.0);
+    }
+  }
+
+  Path _buildLinePath(Proj3D proj, List<Vec3> pts) {
+    final path = Path();
+    final firstPt = proj.project(pts.first);
+    path.moveTo(firstPt.dx, firstPt.dy);
+    for (int i = 1; i < pts.length; i++) {
+      final pt = proj.project(pts[i]);
+      path.lineTo(pt.dx, pt.dy);
+    }
+    return path;
+  }
+
+  void _drawArrow(Canvas canvas, Offset from, Offset to, Color color, double sw,
+      [double arrowSize = 5.0]) {
+    final dx = to.dx - from.dx;
+    final dy = to.dy - from.dy;
+    final len = math.sqrt(dx * dx + dy * dy);
+    if (len < 1.0) return; // 너무 짧으면 스킵
+    final angle = math.atan2(dy, dx);
+    final path = Path();
+    path.moveTo(to.dx, to.dy);
+    path.lineTo(to.dx - arrowSize * math.cos(angle - 0.45),
+                to.dy - arrowSize * math.sin(angle - 0.45));
+    path.moveTo(to.dx, to.dy);
+    path.lineTo(to.dx - arrowSize * math.cos(angle + 0.45),
+                to.dy - arrowSize * math.sin(angle + 0.45));
+    canvas.drawPath(path, Paint()..color = color..strokeWidth = sw..style = PaintingStyle.stroke);
+  }
+
+  // ----------------------------------------------------------
+  // 라벨 & 치수선
+  // ----------------------------------------------------------
+  void _drawLabels(Canvas canvas, Proj3D proj,
+      TankSettings tank, AnodeSettings anode,
+      List<ProductSettings> products,
+      List<(Vec3, Vec3)> anodePositions, double sl) {
+
+    // 양극 라벨
+    for (int i = 0; i < anodePositions.length; i++) {
+      final (center, _) = anodePositions[i];
+      final topPt = proj.project(Vec3(center.x, center.y + anode.depth/2 + 3, center.z));
+      final label = i % 2 == 0 ? '⊕L${i ~/ 2 + 1}' : '⊕R${i ~/ 2 + 1}';
+      _text(canvas, topPt, label, const Color(0xFFFF8C00), 11);
+    }
+
+    // 제품 라벨
+    for (int i = 0; i < products.length; i++) {
+      final product = products[i];
+      final prodCY = product.posY + product.depth / 2;
+      final prodTop = proj.project(Vec3(product.posX, prodCY + product.depth/2 + 4, product.posZ));
+      _text(canvas, prodTop, '⊖P${i + 1}', Colors.lightBlueAccent, 11);
+    }
+
+    // 양극-제품 거리 표시
+    if (anodePositions.length >= 2 && products.isNotEmpty) {
+      final leftX  = anodePositions.first.$1.x;
+      final rightX = anodePositions.last.$1.x;
+      final distY  = sl + 8;
+      final refProdZ = products.first.posZ;
+      _drawDimLine(canvas, proj,
+          Vec3(leftX,  distY, refProdZ),
+          Vec3(rightX, distY, refProdZ),
+          '양극간: ${(anode.distFromProduct * 2).toStringAsFixed(0)}cm',
+          const Color(0xFFFFB74D));
+    }
+
+    // 제품 간 거리 표시 (다수 제품)
+    if (products.length >= 2) {
+      for (int i = 0; i < products.length - 1; i++) {
+        final p1 = products[i];
+        final p2 = products[i + 1];
+        final distBetween = (Vec3(p2.posX, p2.posY, p2.posZ) -
+            Vec3(p1.posX, p1.posY, p1.posZ)).length;
+        final midPt = Vec3(
+          (p1.posX + p2.posX) / 2,
+          math.max(p1.posY + p1.depth, p2.posY + p2.depth) + 5,
+          (p1.posZ + p2.posZ) / 2,
+        );
+        _text(canvas, proj.project(midPt),
+          '제품간: ${distBetween.toStringAsFixed(0)}cm',
+          Colors.cyanAccent.withValues(alpha: 0.7), 9);
+      }
+    }
+
+    // 용액 수위 표시
+    final slLabel = proj.project(Vec3(tank.width/2 + 3, sl, -tank.length/2));
+    _text(canvas, slLabel, '수위 ${sl.toStringAsFixed(0)}cm', const Color(0x99AADDFF), 10);
+  }
+
+  void _drawDimLine(Canvas canvas, Proj3D proj, Vec3 from, Vec3 to, String label, Color color) {
+    final p0 = proj.project(from);
+    final p1 = proj.project(to);
+    final paint = Paint()..color = color.withValues(alpha: 0.7)..strokeWidth = 1.0;
+    canvas.drawLine(p0, p1, paint);
+    canvas.drawLine(Offset(p0.dx, p0.dy-4), Offset(p0.dx, p0.dy+4), paint);
+    canvas.drawLine(Offset(p1.dx, p1.dy-4), Offset(p1.dx, p1.dy+4), paint);
+    _text(canvas, Offset((p0.dx+p1.dx)/2, (p0.dy+p1.dy)/2-10), label, color, 10);
+  }
+
+  // ----------------------------------------------------------
+  // 좌표축
+  // ----------------------------------------------------------
+  void _drawAxes(Canvas canvas, Proj3D proj, double len) {
+    final o = const Vec3(0, 0, 0);
+    for (final (end, color, label) in [
+      (Vec3(len, 0, 0), Colors.red,   'X 폭'),
+      (Vec3(0, len, 0), Colors.green, 'Y 깊이'),
+      (Vec3(0, 0, len), Colors.blue,  'Z 길이'),
+    ]) {
+      final p0 = proj.project(o);
+      final p1 = proj.project(end);
+      canvas.drawLine(p0, p1, Paint()..color = color..strokeWidth = 2.0
+        ..style = PaintingStyle.stroke);
+      _text(canvas, p1 + const Offset(4, -4), label, color, 10);
+    }
+  }
+
+  // ----------------------------------------------------------
+  // 도금 두께 범례
+  // ----------------------------------------------------------
+  void _drawThicknessLegend(Canvas canvas, Size size, List<ThicknessPoint> pts) {
+    final active = pts.where((p2) => p2.inSolution && !p2.isMasked).toList();
+    if (active.isEmpty) return;
+
+    final minT = active.map((p2) => p2.thickness).reduce(math.min);
+    final maxT = active.map((p2) => p2.thickness).reduce(math.max);
+    final avgT = active.map((p2) => p2.thickness).reduce((a, b) => a + b) / active.length;
+
+    const bw = 14.0, bh = 100.0;
+    final bx = size.width - 70.0, by = size.height - bh - 50.0;
+
+    // 범례 배경
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(Rect.fromLTWH(bx - 4, by - 16, 65, bh + 36), const Radius.circular(6)),
+      Paint()..color = const Color(0xAA000000),
+    );
+
+    final rect = Rect.fromLTWH(bx, by, bw, bh);
+    canvas.drawRect(rect, Paint()..shader = ui.Gradient.linear(
+      Offset(bx, by + bh), Offset(bx, by),
+      [const Color(0xFF0000FF), const Color(0xFF00FF00),
+       const Color(0xFFFFFF00), const Color(0xFFFF0000)],
+      [0.0, 0.33, 0.67, 1.0],
+    ));
+    canvas.drawRect(rect, Paint()
+      ..color = Colors.white38..strokeWidth = 0.8..style = PaintingStyle.stroke);
+
+    _text(canvas, Offset(bx - 4, by - 14), '도금두께(µm)', Colors.white70, 8);
+    _text(canvas, Offset(bx + bw + 3, by - 4), maxT.toStringAsFixed(2), Colors.red, 9);
+    _text(canvas, Offset(bx + bw + 3, by + bh/2 - 5), avgT.toStringAsFixed(2), Colors.greenAccent, 8);
+    _text(canvas, Offset(bx + bw + 3, by + bh - 4), minT.toStringAsFixed(2), Colors.blueAccent, 9);
+    _text(canvas, Offset(bx - 4, by + bh + 4), 'avg:${avgT.toStringAsFixed(2)}µm', Colors.white60, 8);
+  }
+
+  // ----------------------------------------------------------
+  // 전기장 강도 범례
+  // ----------------------------------------------------------
+  void _drawFieldStrengthLegend(Canvas canvas, Size size, List<FieldStrengthPoint> pts) {
+    final active = pts.where((p2) => p2.inSolution && p2.strength > 0).toList();
+    if (active.isEmpty) return;
+
+    // minS/maxS used for legend context (implicitly via gradient shader)
+    // ignore: unused_local_variable
+
+    const bw = 14.0, bh = 100.0;
+    final bx = size.width - 70.0, by = size.height - bh - 50.0;
+
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(Rect.fromLTWH(bx - 4, by - 16, 65, bh + 36), const Radius.circular(6)),
+      Paint()..color = const Color(0xAA000000),
+    );
+
+    final rect = Rect.fromLTWH(bx, by, bw, bh);
+    canvas.drawRect(rect, Paint()..shader = ui.Gradient.linear(
+      Offset(bx, by + bh), Offset(bx, by),
+      [const Color(0xFF6400C8), const Color(0xFFFF00FF), const Color(0xFFFFFFFF)],
+      [0.0, 0.5, 1.0],
+    ));
+    canvas.drawRect(rect, Paint()
+      ..color = Colors.white38..strokeWidth = 0.8..style = PaintingStyle.stroke);
+
+    _text(canvas, Offset(bx - 4, by - 14), '전기장강도', Colors.white70, 8);
+    _text(canvas, Offset(bx + bw + 3, by - 4), 'High', Colors.white, 9);
+    _text(canvas, Offset(bx + bw + 3, by + bh - 4), 'Low', Colors.purpleAccent, 9);
+    _text(canvas, Offset(bx - 4, by + bh + 4), '분포 컬러맵', Colors.white60, 8);
+  }
+
+  // ----------------------------------------------------------
+  // 오버레이 정보
+  // ----------------------------------------------------------
+  void _drawOverlayInfo(Canvas canvas, Size size, PlatingProvider p) {
+    final modeLabel = p.heatmapMode == HeatmapMode.thickness ? '두께맵' : '전기장맵';
+    _text(canvas, Offset(10, size.height - 20),
+        'Zoom: ${p.zoom.toStringAsFixed(2)}x  |  제품: ${p.productCount}개  |  '
+        '표면적: ${p.totalSurfaceAreaDm2.toStringAsFixed(2)} dm²  |  모드: $modeLabel',
+        Colors.white30, 10);
+  }
+
+  void _text(Canvas canvas, Offset pos, String text, Color color, double fs) {
+    final tp = TextPainter(
+      text: TextSpan(text: text, style: TextStyle(
+        color: color, fontSize: fs, fontWeight: FontWeight.w500,
+        shadows: const [Shadow(color: Colors.black87, blurRadius: 3, offset: Offset(1,1))],
+      )),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    tp.paint(canvas, pos);
+  }
+
+  @override
+  bool shouldRepaint(covariant PlatingScene3DPainter oldDelegate) => true;
+}
+
+// ============================================================
+// 배경 그리드
+// ============================================================
+class GridBgPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = Colors.white.withValues(alpha: 0.025)
+      ..strokeWidth = 1.0;
+    const spacing = 40.0;
+    for (double x = 0; x < size.width; x += spacing) {
+      canvas.drawLine(Offset(x, 0), Offset(x, size.height), paint);
+    }
+    for (double y = 0; y < size.height; y += spacing) {
+      canvas.drawLine(Offset(0, y), Offset(size.width, y), paint);
+    }
+  }
+  @override
+  bool shouldRepaint(covariant CustomPainter old) => false;
+}
+
+// ============================================================
+// 2D 전기력선 CustomPainter
+// mode=top  → 위에서 내려본 (XZ 평면): X=가로, Z=세로
+// mode=side → 옆에서 바라본 (XY 평면): X=가로, Y=세로
+// ============================================================
+class FieldLine2DPainter extends CustomPainter {
+  final PlatingProvider p;
+  final FieldLine2DMode mode;
+
+  FieldLine2DPainter({required this.p, required this.mode});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final tank   = p.tank;
+    final anode  = p.anode;
+    final products = p.products;
+    final fieldLines = p.fieldLines;
+    final sl = tank.solutionLevel;
+
+    // 뷰 범위 결정
+    final viewW = tank.width;
+    final viewH = mode == FieldLine2DMode.top ? tank.length : sl;
+
+    final scaleX = size.width  * 0.88 / viewW.clamp(1.0, 100000.0);
+    final scaleY = size.height * 0.88 / viewH.clamp(1.0, 100000.0);
+    final offsetX = size.width  * 0.06;
+    final offsetY = mode == FieldLine2DMode.top ? size.height * 0.06 : size.height * 0.94;
+
+    // 2D 프로젝션
+    Offset proj2D(Vec3 v) {
+      if (mode == FieldLine2DMode.top) {
+        // 위에서 내려본: XZ 평면 (X→가로, Z→세로, Y 무시)
+        return Offset(
+          offsetX + (v.x + viewW / 2) * scaleX,
+          offsetY + (v.z + tank.length / 2) * scaleY,
+        );
+      } else {
+        // 옆에서 바라본: XY 평면 (X→가로, Y→세로 아래→위)
+        return Offset(
+          offsetX + (v.x + viewW / 2) * scaleX,
+          offsetY - v.y * scaleY,
+        );
+      }
+    }
+
+    // 배경
+    canvas.drawRect(Rect.fromLTWH(0, 0, size.width, size.height),
+      Paint()..color = const Color(0xFF060C18));
+
+    // 그리드선
+    _drawGrid(canvas, size, offsetX, offsetY, scaleX, scaleY, viewW, viewH, sl);
+
+    // 탱크 외곽선
+    _drawTankOutline(canvas, proj2D, tank, sl);
+
+    // 양극 위치
+    final anodePositions = PlatingSimulationService.getAnodePositionsMulti(
+      tank: tank, anode: anode, products: products,
+    );
+    _drawAnodes2D(canvas, proj2D, anode, anodePositions, sl);
+
+    // 제품 윤곽
+    for (int i = 0; i < products.length; i++) {
+      _drawProduct2D(canvas, proj2D, products[i], i);
+    }
+
+    // 전기력선
+    if (fieldLines.isNotEmpty) {
+      _drawFieldLines2D(canvas, proj2D, fieldLines, sl);
+    }
+
+    // 범례 라벨
+    _drawLabels2D(canvas, size, mode);
+  }
+
+  void _drawGrid(Canvas canvas, Size size, double ox, double oy,
+      double sx, double sy, double vw, double vh, double sl) {
+    final gPaint = Paint()
+      ..color = Colors.white.withValues(alpha: 0.05)
+      ..strokeWidth = 0.5;
+    const step = 10.0;
+    for (double x = -vw/2; x <= vw/2; x += step) {
+      final px = ox + (x + vw/2) * sx;
+      canvas.drawLine(Offset(px, 0), Offset(px, size.height), gPaint);
+    }
+    if (mode == FieldLine2DMode.top) {
+      for (double z = -vh/2; z <= vh/2; z += step) {
+        final py = oy + (z + vh/2) * sy;
+        canvas.drawLine(Offset(0, py), Offset(size.width, py), gPaint);
+      }
+    } else {
+      for (double y = 0; y <= sl; y += step) {
+        final py = oy - y * sy;
+        canvas.drawLine(Offset(0, py), Offset(size.width, py), gPaint);
+      }
+    }
+  }
+
+  void _drawTankOutline(Canvas canvas, Offset Function(Vec3) proj, TankSettings tank, double sl) {
+    final paint = Paint()
+      ..color = Colors.blueGrey.withValues(alpha: 0.4)
+      ..strokeWidth = 1.5
+      ..style = PaintingStyle.stroke;
+
+    if (mode == FieldLine2DMode.top) {
+      // XZ 사각형
+      final tl = proj(Vec3(-tank.width/2, 0, -tank.length/2));
+      final tr = proj(Vec3( tank.width/2, 0, -tank.length/2));
+      final br = proj(Vec3( tank.width/2, 0,  tank.length/2));
+      final bl = proj(Vec3(-tank.width/2, 0,  tank.length/2));
+      canvas.drawPath(Path()..moveTo(tl.dx,tl.dy)..lineTo(tr.dx,tr.dy)
+        ..lineTo(br.dx,br.dy)..lineTo(bl.dx,bl.dy)..close(), paint);
+    } else {
+      // XY 사각형 (용액 수위까지)
+      final tl = proj(Vec3(-tank.width/2, sl, 0));
+      final tr = proj(Vec3( tank.width/2, sl, 0));
+      final br = proj(Vec3( tank.width/2,  0, 0));
+      final bl = proj(Vec3(-tank.width/2,  0, 0));
+      canvas.drawPath(Path()..moveTo(tl.dx,tl.dy)..lineTo(tr.dx,tr.dy)
+        ..lineTo(br.dx,br.dy)..lineTo(bl.dx,bl.dy)..close(), paint);
+      // 용액면
+      final sLine = Paint()..color = const Color(0x6600B4D8)..strokeWidth = 1.5;
+      canvas.drawLine(tl, tr, sLine);
+    }
+  }
+
+  void _drawAnodes2D(Canvas canvas, Offset Function(Vec3) proj,
+      AnodeSettings anode, List<(Vec3, Vec3)> positions, double sl) {
+    final paint = Paint()
+      ..color = const Color(0xCCFF8C00)
+      ..style = PaintingStyle.fill;
+    final borderPaint = Paint()
+      ..color = const Color(0xFFFF6500)
+      ..strokeWidth = 1.5
+      ..style = PaintingStyle.stroke;
+
+    for (int i = 0; i < positions.length; i++) {
+      final (center, _) = positions[i];
+      Rect rect;
+      if (mode == FieldLine2DMode.top) {
+        final tl = proj(Vec3(center.x - anode.width/2, 0, center.z - anode.length/2));
+        final br = proj(Vec3(center.x + anode.width/2, 0, center.z + anode.length/2));
+        rect = Rect.fromLTRB(math.min(tl.dx, br.dx), math.min(tl.dy, br.dy), math.max(tl.dx, br.dx), math.max(tl.dy, br.dy));
+      } else {
+        final yBot = (center.y - anode.depth/2).clamp(0.0, sl);
+        final yTop = (center.y + anode.depth/2).clamp(0.0, sl);
+        final tl = proj(Vec3(center.x - anode.width/2, yTop, 0));
+        final br = proj(Vec3(center.x + anode.width/2, yBot, 0));
+        rect = Rect.fromLTRB(math.min(tl.dx, br.dx), math.min(tl.dy, br.dy), math.max(tl.dx, br.dx), math.max(tl.dy, br.dy));
+      }
+      if (rect.width < 2) rect = rect.inflate(2);
+      canvas.drawRect(rect, paint);
+      canvas.drawRect(rect, borderPaint);
+      final labelPt = rect.topCenter + const Offset(0, -12);
+      _text2D(canvas, labelPt, i % 2 == 0 ? '⊕L' : '⊕R', const Color(0xFFFF8C00), 9);
+    }
+  }
+
+  void _drawProduct2D(Canvas canvas, Offset Function(Vec3) proj,
+      ProductSettings prod, int idx) {
+    final paint = Paint()
+      ..color = const Color(0x5500B4D8)
+      ..style = PaintingStyle.fill;
+    final border = Paint()
+      ..color = Colors.lightBlueAccent
+      ..strokeWidth = 1.5
+      ..style = PaintingStyle.stroke;
+
+    Rect rect;
+    final cy = prod.posY + prod.depth / 2;
+    if (mode == FieldLine2DMode.top) {
+      final tl = proj(Vec3(prod.posX - prod.width/2, 0, prod.posZ - prod.length/2));
+      final br = proj(Vec3(prod.posX + prod.width/2, 0, prod.posZ + prod.length/2));
+      rect = Rect.fromLTRB(math.min(tl.dx, br.dx), math.min(tl.dy, br.dy), math.max(tl.dx, br.dx), math.max(tl.dy, br.dy));
+    } else {
+      final tl = proj(Vec3(prod.posX - prod.width/2, cy + prod.depth/2, 0));
+      final br = proj(Vec3(prod.posX + prod.width/2, cy - prod.depth/2, 0));
+      rect = Rect.fromLTRB(math.min(tl.dx, br.dx), math.min(tl.dy, br.dy), math.max(tl.dx, br.dx), math.max(tl.dy, br.dy));
+    }
+    canvas.drawRect(rect, paint);
+    canvas.drawRect(rect, border);
+    _text2D(canvas, rect.topCenter + const Offset(-8, -13), '⊖P${idx+1}', Colors.lightBlueAccent, 9);
+  }
+
+  void _drawFieldLines2D(Canvas canvas, Offset Function(Vec3) proj,
+      List<FieldLine> lines, double sl) {
+    for (final line in lines) {
+      if (line.points.length < 2) continue;
+
+      final alpha = (line.intensity * 160 + 60).round().clamp(40, 220);
+      final paint = Paint()
+        ..color = Color.fromARGB(alpha, 255, (180 + line.intensity * 70).round().clamp(0,255), (line.intensity * 30).round().clamp(0,100))
+        ..strokeWidth = (line.intensity * 1.5 + 0.6).clamp(0.5, 2.5)
+        ..style = PaintingStyle.stroke
+        ..strokeCap = StrokeCap.round;
+
+      final validPts = line.points.where((pt) => pt.y <= sl + 0.5).toList();
+      if (validPts.length < 2) continue;
+
+      final path = Path();
+      final f = proj(validPts.first);
+      path.moveTo(f.dx, f.dy);
+      for (int i = 1; i < validPts.length; i++) {
+        final pt = proj(validPts[i]);
+        path.lineTo(pt.dx, pt.dy);
+      }
+      canvas.drawPath(path, paint);
+
+      // 화살표
+      if (validPts.length >= 2) {
+        final n = validPts.length;
+        final p0 = proj(validPts[n - 2]);
+        final p1 = proj(validPts[n - 1]);
+        _drawArrow2D(canvas, p0, p1, Color.fromARGB(alpha, 255, 200, 0),
+            (line.intensity + 0.5).clamp(0.5, 2.0));
+      }
+    }
+  }
+
+  void _drawArrow2D(Canvas canvas, Offset from, Offset to, Color color, double sw) {
+    final dx = to.dx - from.dx;
+    final dy = to.dy - from.dy;
+    final angle = math.atan2(dy, dx);
+    const size = 5.0;
+    final path = Path();
+    path.moveTo(to.dx, to.dy);
+    path.lineTo(to.dx - size * math.cos(angle - 0.45), to.dy - size * math.sin(angle - 0.45));
+    path.moveTo(to.dx, to.dy);
+    path.lineTo(to.dx - size * math.cos(angle + 0.45), to.dy - size * math.sin(angle + 0.45));
+    canvas.drawPath(path, Paint()..color = color..strokeWidth = sw..style = PaintingStyle.stroke);
+  }
+
+  void _drawLabels2D(Canvas canvas, Size size, FieldLine2DMode mode) {
+    final modeStr = mode == FieldLine2DMode.top ? '위에서 내려본 뷰 (XZ 평면)' : '옆에서 바라본 뷰 (XY 단면)';
+    final xLabel  = 'X→ (폭)';
+    final yLabel  = mode == FieldLine2DMode.top ? 'Z→ (길이)' : 'Y↑ (깊이)';
+
+    final bg = Paint()..color = Colors.black54;
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(Rect.fromLTWH(6, 6, 220, 22), const Radius.circular(4)), bg);
+    _text2D(canvas, const Offset(10, 9), '2D 전기력선 — $modeStr', Colors.cyanAccent, 9);
+    _text2D(canvas, Offset(size.width - 50, size.height - 18), xLabel, Colors.white38, 8);
+    _text2D(canvas, Offset(4, size.height / 2), yLabel, Colors.white38, 8);
+  }
+
+  void _text2D(Canvas canvas, Offset pos, String text, Color color, double fs) {
+    final tp = TextPainter(
+      text: TextSpan(text: text, style: TextStyle(
+        color: color, fontSize: fs, fontWeight: FontWeight.w500,
+        shadows: const [Shadow(color: Colors.black87, blurRadius: 3, offset: Offset(1,1))],
+      )),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    tp.paint(canvas, pos);
+  }
+
+  @override
+  bool shouldRepaint(covariant FieldLine2DPainter old) => true;
+}
